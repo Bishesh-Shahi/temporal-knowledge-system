@@ -124,6 +124,16 @@ class AnswerEngine:
         self._link_pop_cache: dict[int, Counter] = {}
         self._vocab: Optional[set[str]] = None
 
+    def warm_up(self) -> None:
+        """Precompute the BM25 index, catalog vocabulary and latest-view caches."""
+        if not self.store.snapshots:
+            return
+        self.store.build_index()
+        self._row_vocab()
+        latest = len(self.store.snapshots) - 1
+        self._superseded_tables(latest)
+        self._link_popularity(latest)
+
     # ---------------------------------------------------------------- entry point
     def answer(self, question: str, as_of: Optional[str] = None) -> tuple[Evidence, Optional[int]]:
         q = parse_question(question)

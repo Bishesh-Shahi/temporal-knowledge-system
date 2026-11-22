@@ -65,6 +65,9 @@ class TemporalKnowledgeSystem:
             self.engine = AnswerEngine(self.store)
             self._answer_cache.clear()
             self._conflicts = None
+            # ingest is not latency-scored but answers are: build the index and the per-view
+            # caches now so the first question pays nothing extra
+            self.engine.warm_up()
 
     def answer(self, question: str, as_of: Optional[str] = None) -> Answer:
         key = ((question or "").strip(), as_of)
