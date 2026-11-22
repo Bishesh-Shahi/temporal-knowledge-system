@@ -54,11 +54,17 @@ def _norm_label(label: str) -> str:
     return re.sub(r"\s+", " ", s).strip(" |")
 
 
-def _label_shape(label: str) -> str:
-    """Row label with every number abstracted: '2023-26 Model Year | 60 Months' -> '# model year | # month'."""
+def _label_shape(label: str, caption: str = "") -> str:
+    """Row label with every number abstracted: '2023-26 Model Year | 60 Months' -> '# model year | # month'.
+    The table's own product name is removed, so a table that repeats it in a column
+    ('1st Rate Checking | $5,000 - $24,999.99') matches one that does not ('$5,000 - $24,999.99')."""
     s = _norm_label(label)
+    product = _norm_label(caption.split(" / ")[-1]) if caption else ""
+    if product and len(product) > 3:
+        s = s.replace(product, " ")
     s = re.sub(r"\d[\d,.]*", "#", s)
-    return re.sub(r"#(?:\s*-\s*#)+", "#", s)
+    s = re.sub(r"#(?:\s*-\s*#)+", "#", s)
+    return re.sub(r"\s+", " ", s).strip(" |")
 
 
 def _resolution_key(b: Block) -> tuple:
@@ -116,6 +122,7 @@ class AnswerEngine:
         self.store = store
         self._superseded_cache: dict[int, set] = {}
         self._link_pop_cache: dict[int, Counter] = {}
+        self._vocab: Optional[set[str]] = None
 
     # ---------------------------------------------------------------- entry point
     def answer(self, question: str, as_of: Optional[str] = None) -> tuple[Evidence, Optional[int]]:
@@ -127,6 +134,7 @@ class AnswerEngine:
         q.product_terms = [t for t in q.product_terms if t not in org_terms]
         q.required = [t for t in q.required if t not in org_terms]
         q.entities = [t for t in q.entities if t not in org_terms]
+        q.modifiers = [t for t in q.modifiers if t not in org_terms]
         if self.store.org_name.lower() in q.lower and self.store.org_label not in q.lower:
             q.lower = q.lower.replace(self.store.org_name.lower(), self.store.org_label)
         as_of_d = _parse_date(as_of)
@@ -175,6 +183,29 @@ class AnswerEngine:
         title = "" if b.caption else b.page_title
         return set(tokens(f"{title} {b.heading} {b.caption} {b.label} {' '.join(b.headers)}"))
 
+    def _row_vocab(self) -> set[str]:
+        """Every word used anywhere in a rate/fee table's context: the catalog's vocabulary."""
+        if self._vocab is None:
+            vocab: set[str] = set()
+            for b in self.store.blocks:
+                if b.kind == "row" and b.values:
+                    vocab |= self._row_context(b)
+            self._vocab = vocab
+        return self._vocab
+
+    def _required_for_rows(self, q: Query) -> list[str]:
+        """Words a table row must match.  A word naming the product ("lot" loan, "reverse"
+        mortgage) is always required: if no row has it, the site does not publish that rate.
+        Other words are required only if the catalog ever uses them (otherwise they are phrasing)."""
+        if q._req_cache is None:
+            vocab = self._row_vocab()
+            req = list(q.modifiers)
+            for t in q.required:
+                if t not in req and any(e in vocab for e in expand(t)):
+                    req.append(t)
+            q._req_cache = req
+        return q._req_cache
+
     def _superseded_tables(self, k: int) -> set:
         """Tables (page, caption, headers, eff_date) that are stale copies of a table family whose
         newer edition (later effective date) exists on another page in the same view."""
@@ -187,22 +218,16 @@ class AnswerEngine:
         # Two tables on different pages are editions of the same table when (a) most of their row
         # labels coincide once digits are abstracted (tier bands like "2023-26" vs "2024-27" shift
         # between editions) and (b) their captions name a common product word.
-        sigs, caps = {}, {}
-        for key, rows in tables.items():
-            sigs[key] = {_label_shape(r.label) for r in rows}
-            caps[key] = table_context(key[1], rows)
+        info = {key: TableInfo(key[1], rows) for key, rows in tables.items()}
         by_sig: dict[str, list[tuple]] = defaultdict(list)
-        for key, ss in sigs.items():
-            for sg in ss:
+        for key, ti in info.items():
+            for sg in ti.raw | ti.stripped:
                 by_sig[sg].append(key)
         stale: set = set()
         for a in tables:
-            peers = {b for sg in sigs[a] for b in by_sig[sg] if b[0] != a[0]}
+            peers = {b for sg in info[a].raw | info[a].stripped for b in by_sig[sg] if b[0] != a[0]}
             for b in peers:
-                sa, sb = sigs[a], sigs[b]
-                if len(sa & sb) / min(len(sa), len(sb)) < 0.5:
-                    continue
-                if not (caps[a] & caps[b]):
+                if not same_table_edition(info[a], info[b]):
                     continue
                 da, db = a[3], b[3]
                 auth_a, auth_b = tables[a][0].authority, tables[b][0].authority
@@ -213,7 +238,7 @@ class AnswerEngine:
 
     def _score_row(self, q: Query, b: Block, ctx: set[str]) -> Optional[float]:
         idf = self.store.idf
-        for t in q.required:
+        for t in self._required_for_rows(q):
             if not any(e in ctx for e in expand(t)):
                 return None
         label = b.label
@@ -409,6 +434,11 @@ class AnswerEngine:
         if not hits:
             return []
         top = hits[0][0]
+        want_money = bool(re.search(r"\bhow much\b|\b(cost|fee|price|amount|charge)", q.lower))
+        want_address = _wants_address(q)
+        want_date = q.lower.startswith("when")
+        want_phone = bool(re.search(r"\b(phone|call|number|extension|telephone)\b", q.lower)) and \
+            "routing" not in q.lower and "account number" not in q.lower
         ranked = []
         for s, b in hits:
             if b.page_class in ("junk", "listing"):
@@ -416,6 +446,17 @@ class AnswerEngine:
             cov = self._coverage(q, b.terms)
             ent = self._entities_ok(q, b)
             final = (s / top) * (0.6 + 0.4 * b.authority) + 0.8 * cov + (0.0 if ent else -2.0)
+            # answer-shape evidence: the passage contains the kind of thing asked for
+            if want_money and "$" in b.text:
+                final += 0.4
+            if want_address and _ADDRESS_RE.search(b.text):
+                final += 0.4
+            if want_date and LONG_DATE_RE.search(b.text):
+                final += 0.3
+            if want_phone and _PHONE_RE.search(b.text):
+                final += 0.4
+            if len(b.text) < 60:
+                final -= 0.5           # a card fragment ("Madison. Wisconsin. Apply.") says little
             ranked.append((final, cov, b))
         ranked.sort(key=lambda x: (-x[0], x[2].bid))
         return ranked
@@ -459,6 +500,7 @@ class AnswerEngine:
         want_date = q.lower.startswith("when")
         want_money = bool(re.search(r"\bhow much\b|\b(cost|fee|price|amount|award)", q.lower))
         want_address = _wants_address(q)
+        want_phone = bool(re.search(r"\b(phone|call|extension|telephone)\b", q.lower))
         definitional = bool(re.match(r"(what|who) (is|are)\b|tell me about|describe|explain", q.lower))
         sent_toks = [set(tokens(s)) for s in sents]
         best_key, best_win = None, (0, 1)
@@ -480,6 +522,8 @@ class AnswerEngine:
                     bonus += 2.0
                 if want_address and _ADDRESS_RE.search(window):
                     bonus += 3.0
+                if want_phone and _PHONE_RE.search(window):
+                    bonus += 2.0
                 if q.entities and all(e in toks for e in q.entities):
                     bonus += 1.5
                 width_pref = (w if definitional else -w)
@@ -613,14 +657,15 @@ class AnswerEngine:
 
     # ================================================================ counts
     def _count_answer(self, q: Query, k: int) -> Optional[Evidence]:
-        m = re.search(r"how many ([a-z' -]+?)(?: does| do| did| are| is| were| was| have| has|\?|$)", q.lower)
+        m = re.search(r"(?:how many|number of|count of) ([a-z' -]+?)(?: does| do| did| are| is| were| was"
+                      r"| have| has| at| in|\?|$)", q.lower)
         if not m:
             return None
         noun_toks = [t for t in tokens(m.group(1)) if t not in SOFT_WORDS]
         if not noun_toks:
             return None
         noun = noun_toks[0]
-        context = [t for t in q.product_terms if t != noun]
+        context = [t for t in q.product_terms if t != noun and t not in SOFT_WORDS]
         org = self.store.org_label
         claims = []   # (published, count, sentence, block)
         # a count claim: a number followed, within 4 words, by the counted noun ("22 branch offices",
@@ -664,12 +709,22 @@ class AnswerEngine:
 
     @staticmethod
     def _count_phrase(sentence: str, count: int, noun: str) -> str:
-        m = re.search(rf"\b{count:,}\b\s+((?:[A-Za-z'-]+\s+){{0,3}}?[A-Za-z]*{noun}[a-z]*(?:\s+[a-z]+){{0,2}})",
-                      sentence, re.I) or re.search(rf"\b{count}\b\s+((?:[A-Za-z'-]+\s+){{0,3}}?[A-Za-z]*{noun}[a-z]*)",
-                                                    sentence, re.I)
-        phrase = m.group(1).strip() if m else noun
-        phrase = re.sub(r"\s+(in|at|and|with|of|throughout|across)$", "", phrase)
-        return f"{count} {phrase}"
+        """Words following the count up to the counted noun (matched by stem), plus up to two
+        trailing lower-case words of the same noun phrase: '22 branch office locations'."""
+        m = re.search(rf"\b(?:{count:,}|{count})\b((?:\s+[A-Za-z$'-]+){{1,6}})", sentence)
+        if not m:
+            return f"{count} {noun}"
+        words = m.group(1).split()
+        stop = {"in", "at", "and", "with", "of", "throughout", "across", "to", "for", "who", "that"}
+        for j, w in enumerate(words[:4]):
+            if tokens(w) == [noun]:
+                tail = []
+                for x in words[j + 1:j + 3]:
+                    if x.lower() in stop or not x.islower():
+                        break
+                    tail.append(x)
+                return f"{count} {' '.join(words[:j + 1] + tail).strip(' ,.;')}"
+        return f"{count} {noun}"
 
     def _year_series(self, claims, q: Query) -> Evidence:
         series = {}
@@ -834,3 +889,38 @@ def table_context(caption: str, rows: list[Block]) -> set[str]:
     labels = " ".join(r.label for r in rows)
     src = f"{' '.join(caption.split(' / ')[-2:])} {heading} {labels}"
     return {t for t in tokens(src) if t.isalpha()} - RATE_WORDS - SOFT_WORDS
+
+
+_PHONE_RE = re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
+
+
+class TableInfo:
+    """Row-shape signatures and product context of one table instance."""
+    __slots__ = ("raw", "stripped", "context", "product", "business")
+
+    def __init__(self, caption: str, rows: list[Block]) -> None:
+        self.raw = {_label_shape(r.label) for r in rows}
+        self.stripped = {_label_shape(r.label, caption) for r in rows}
+        self.context = table_context(caption, rows)
+        self.product = _norm_label(caption.split(" / ")[-1]) if caption else ""
+        self.business = _is_business(rows[0])
+
+
+def same_table_edition(a: TableInfo, b: TableInfo) -> bool:
+    """Two tables are editions of one table when they describe the same (personal vs business)
+    product family and most row labels coincide once numbers are abstracted.  Labels with the
+    product name removed are compared only when both captions name the same product, so tiers of
+    different products ('Share Savings $10,000+' vs 'Health Savings $10,000+') never merge."""
+    if a.business != b.business or not (a.context & b.context):
+        return False
+
+    def overlap(x: set, y: set) -> float:
+        return len(x & y) / min(len(x), len(y)) if x and y else 0.0
+
+    if overlap(a.raw, b.raw) >= 0.5:
+        return True
+    # a table whose rows are bare tiers ("$5,000 - $24,999.99") names no product itself; it can be
+    # an edition of a table that repeats the product name in every row
+    bare = a.raw == a.stripped or b.raw == b.stripped
+    same_product = bool(a.product) and a.product == b.product
+    return (same_product or bare) and overlap(a.stripped, b.stripped) >= 0.5

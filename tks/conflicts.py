@@ -28,8 +28,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
-from .engine import (AnswerEngine, _attributable, _label_shape, _norm_label, _resolution_key,
-                     sentences, table_context)
+from .engine import (AnswerEngine, TableInfo, _attributable, _norm_label, _resolution_key,
+                     same_table_edition, sentences)
 from .query import RATE_WORDS, SOFT_WORDS
 from .store import Block, KnowledgeStore
 from .text import tokens
@@ -97,24 +97,19 @@ def _table_families(store: KnowledgeStore) -> tuple[dict, dict]:
         if (b.kind == "row" and b.values and b.label and b.page_class not in ("junk", "listing")
                 and _attributable(b)):
             tables[(b.curl, b.caption, b.headers, b.eff_date)].append(b)
-    sigs = {k: {_label_shape(r.label) for r in rows} for k, rows in tables.items()}
-
-    caps = {k: table_context(k[1], rows) for k, rows in tables.items()}
+    info = {k: TableInfo(k[1], rows) for k, rows in tables.items()}
     by_sig: dict[str, list[tuple]] = defaultdict(list)
-    for k, ss in sigs.items():
-        for sg in ss:
+    for k, ti in info.items():
+        for sg in ti.raw | ti.stripped:
             by_sig[sg].append(k)
     uf = _UnionFind()
     for a in tables:
         uf.find(a)
-        for b in {x for sg in sigs[a] for x in by_sig[sg]}:
+        for b in {x for sg in info[a].raw | info[a].stripped for x in by_sig[sg]}:
             if b == a:
                 continue
-            sa, sb = sigs[a], sigs[b]
-            if len(sa & sb) / min(len(sa), len(sb)) < 0.5:
-                continue
             same_page = a[0] == b[0] and a[1] == b[1]
-            if not same_page and not (caps[a] & caps[b]):
+            if not same_page and not same_table_edition(info[a], info[b]):
                 continue
             uf.union(a, b)
     return tables, {k: uf.find(k) for k in tables}
@@ -128,12 +123,15 @@ def _table_conflicts(store: KnowledgeStore) -> list[ConflictRecord]:
 
     facts: dict[tuple, list[Block]] = defaultdict(list)
     for tkey, rows in tables.items():
-        occ: Counter = Counter()
+        # occurrence index among rows with the same key that were on the page *at the same time*
+        # (several model-year bands of one edition), so successive editions of a row align
+        seen: dict[str, list[Block]] = defaultdict(list)
         for r in sorted(rows, key=lambda b: b.bid):
             rk = _row_key(r.label)
             kinds = tuple(sorted({v[0] for v in r.values}))
-            facts[(family[tkey], rk, occ[rk], kinds)].append(r)
-            occ[rk] += 1
+            occ = sum(1 for o in seen[rk] if o.observed & r.observed)
+            facts[(family[tkey], rk, occ, kinds)].append(r)
+            seen[rk].append(r)
 
     out: list[ConflictRecord] = []
     bit = 1 << latest

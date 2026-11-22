@@ -28,7 +28,9 @@ SOFT_WORDS = frozenset(
     intro introductory promotional promo late early mid version advertise advertised advertising
     lock locked stretch stretched financing finance financed brand want looking plan planning
     reach someone anyone today now current currently right lowest ask asking pick choose
-    option options whats thing things way ways start starting new open opening apply money""".split()
+    option options whats thing things way ways start starting new open opening apply money
+    minimum min send sending take taking using use operate operates run runs maintain maintains
+    yr yrs please number numbers count total""".split()
 )
 # Query-side synonym expansion (domain lexicon). Keys/values are stemmed tokens.
 SYNONYMS: dict[str, tuple[str, ...]] = {
@@ -74,7 +76,7 @@ _SUPER_LOW_RE = re.compile(r"\b(lowest|cheapest|least)\b")
 _URL_RE = re.compile(r"\b(links?|urls?|website|web ?site|web address|web page|webpage|locator)\b")
 _URL_WEAK_RE = re.compile(r"\bonline\b")
 _HOURS_RE = re.compile(r"\b(hours|open until|what time|when .* open|opening times)\b")
-_COUNT_RE = re.compile(r"\bhow many\b")
+_COUNT_RE = re.compile(r"\bhow many\b|\bnumber of\b|\bcount of\b|\btotal number\b")
 _RATE_RE = re.compile(r"\b(rates?|apys?|aprs?|dividends?|interest|yields?)\b|%")
 _YESNO_RE = re.compile(r"^(do|does|is|are|can|could|will|did|has|have|was|were)\b")
 _STILL_RE = re.compile(r"\b(still|anymore|any more|currently)\b.*\b(open|available|offered|operating)\b|"
@@ -112,6 +114,8 @@ class Query:
     asks_last_year: bool = False
     superlative: Optional[str] = None      # "high" | "low" | "best" (direction depends on kind)
     negated: list[str] = field(default_factory=list)   # "not the jumbo" -> ["jumbo"]
+    modifiers: list[str] = field(default_factory=list)  # words naming the product ("lot" in "lot loan")
+    _req_cache: Optional[list[str]] = None
 
 
 def _stem_set(words) -> frozenset:
@@ -128,15 +132,35 @@ _STREET_WORDS = _stem_set(_STREET_WORDS)
 _MONTH_TOKENS = frozenset(stem(m) for m in _MONTHS) - {"mar", "may"} | {"may"}
 
 
-_NUMBER_WORD_VALUES = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
-    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "eighteen": 18, "twenty": 20,
-    "twenty-four": 24, "thirty": 30, "thirty-six": 36, "forty": 40, "forty-eight": 48, "sixty": 60,
-    "seventy-two": 72, "eighty-four": 84,
-}
+_UNITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+          "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+          "nineteen"]
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+         "eighty": 80, "ninety": 90}
+_NUMBER_WORD_VALUES = {w: i for i, w in enumerate(_UNITS)} | dict(_TENS)
+for _t, _tv in _TENS.items():               # compounds: "twenty-four", "eighty four"
+    for _u in range(1, 10):
+        _NUMBER_WORD_VALUES[f"{_t}-{_UNITS[_u]}"] = _tv + _u
+        _NUMBER_WORD_VALUES[f"{_t} {_UNITS[_u]}"] = _tv + _u
 _NUMBER_WORD_RE = re.compile(r"\b(" + "|".join(sorted(_NUMBER_WORD_VALUES, key=len, reverse=True)) + r")\b")
 _NEGATION_RE = re.compile(r"\b(?:not|non|excluding|except|other than|without)\s+(?:the\s+|a\s+|an\s+|any\s+)?([a-z]+)")
-_FEE_Q_RE = re.compile(r"\b(fees?|charges?|costs?|penalty|penalties)\b")
+_FEE_Q_RE = re.compile(r"\b(fees?|costs?|penalty|penalties|surcharges?)\b")
+_CHARGE_RE = re.compile(r"\b(charges?|charged)\b")
+# product head nouns: the words right before them name the product being asked about
+_PRODUCT_HEAD_RE = re.compile(
+    r"((?:[a-z0-9/'-]+\s+){1,2})(?:loans?|mortgages?|certificates?|cds?|accounts?|cards?|iras?|"
+    r"lines? of credit|helocs?|savings|checking|clubs?)\b")
+
+
+def product_modifiers(low: str) -> list[str]:
+    """Words directly naming a product: 'a lot loan' -> ['lot']; 'reverse mortgage' -> ['revers'].
+    These must be matched by evidence; otherwise the site does not publish that product's rate."""
+    out = []
+    for m in _PRODUCT_HEAD_RE.finditer(low):
+        for t in tokens(m.group(1)):
+            if t.isalpha() and t not in SOFT_WORDS and t not in RATE_WORDS and t not in out:
+                out.append(t)
+    return out
 _PAY_RE = re.compile(r"\b(pays?|earns?|earning|paying)\b")
 
 
@@ -156,7 +180,9 @@ def _embedded_date(text: str) -> Optional[date]:
 
 
 def _entities(raw: str) -> list[str]:
-    words = re.findall(r"\b[A-Z][a-zA-Z$'-]+\b", raw)
+    # capitalised words that are not merely sentence-initial ("Number of branches?")
+    words = [m.group(0) for m in re.finditer(r"\b[A-Z][a-zA-Z$'-]+\b", raw)
+             if not re.search(r"(^|[.?!]\s+)$", raw[:m.start()])]
     out = []
     for i, w in enumerate(words):
         if w in _CAP_STOP or w.lower() in _MONTHS:
@@ -171,7 +197,7 @@ def parse_question(question: str) -> Query:
     raw = (question or "").strip()
     low = raw.lower()
     negated = [stem(w) for w in _NEGATION_RE.findall(low)]
-    terms = tokens(raw)
+    terms = tokens(numberize(low))
     numeric = {t for t in terms if re.fullmatch(r"\d+(?:\.\d+)?", t)} | _MONTH_TOKENS
     product_terms = [t for t in terms if t not in RATE_WORDS and t not in numeric and t not in negated]
     required = [t for t in dict.fromkeys(product_terms) if t not in SOFT_WORDS]
@@ -199,7 +225,8 @@ def parse_question(question: str) -> Query:
             q.model_year = y
     q.entities = _entities(raw)
     q.is_url = bool(_URL_RE.search(low))
-    q.is_fee = bool(_FEE_Q_RE.search(low))
+    q.is_fee = bool(_FEE_Q_RE.search(low)) or (bool(_CHARGE_RE.search(low)) and not _RATE_RE.search(low))
+    q.modifiers = [t for t in product_modifiers(numberize(low)) if t not in negated]
     explicit_rate = bool(re.search(r"\b(apys?|aprs?|dividends?|interest|yields?)\b|%", low))
     # "rate" inside a product name ("1st Rate Checking") does not make a fee question a rate question
     q.is_rate = ((explicit_rate or (bool(_RATE_RE.search(low)) and not q.is_fee)
