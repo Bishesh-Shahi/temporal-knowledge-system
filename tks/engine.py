@@ -221,11 +221,11 @@ class AnswerEngine:
         info = {key: TableInfo(key[1], rows) for key, rows in tables.items()}
         by_sig: dict[str, list[tuple]] = defaultdict(list)
         for key, ti in info.items():
-            for sg in ti.raw | ti.stripped:
+            for sg in ti.raw | ti.stripped | ti.tiers:
                 by_sig[sg].append(key)
         stale: set = set()
         for a in tables:
-            peers = {b for sg in info[a].raw | info[a].stripped for b in by_sig[sg] if b[0] != a[0]}
+            peers = {b for sg in info[a].raw | info[a].stripped | info[a].tiers for b in by_sig[sg] if b[0] != a[0]}
             for b in peers:
                 if not same_table_edition(info[a], info[b]):
                     continue
@@ -896,31 +896,49 @@ _PHONE_RE = re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b")
 
 class TableInfo:
     """Row-shape signatures and product context of one table instance."""
-    __slots__ = ("raw", "stripped", "context", "product", "business")
+    __slots__ = ("raw", "stripped", "tiers", "context", "product", "business", "content", "bare")
 
     def __init__(self, caption: str, rows: list[Block]) -> None:
+        self.product = _norm_label(caption.split(" / ")[-1]) if caption else ""
         self.raw = {_label_shape(r.label) for r in rows}
         self.stripped = {_label_shape(r.label, caption) for r in rows}
+        # exact tier labels without the product name, numbers kept ("$5000-$24999.99")
+        self.tiers = {_strip_product(_norm_label(r.label), self.product) for r in rows}
         self.context = table_context(caption, rows)
-        self.product = _norm_label(caption.split(" / ")[-1]) if caption else ""
         self.business = _is_business(rows[0])
+        # do the row labels carry product content themselves ("model year | month")?
+        self.content = {t for s in self.raw for t in tokens(s) if t.isalpha()} - RATE_WORDS - SOFT_WORDS
+        self.bare = self.raw == self.stripped
+
+
+def _strip_product(label: str, product: str) -> str:
+    s = label.replace(product, " ") if product and len(product) > 3 else label
+    return re.sub(r"[\s|]+", "", s)
 
 
 def same_table_edition(a: TableInfo, b: TableInfo) -> bool:
-    """Two tables are editions of one table when they describe the same (personal vs business)
-    product family and most row labels coincide once numbers are abstracted.  Labels with the
-    product name removed are compared only when both captions name the same product, so tiers of
-    different products ('Share Savings $10,000+' vs 'Health Savings $10,000+') never merge."""
+    """Two tables on different pages/snapshots are editions of one table when they describe the
+    same (personal vs business) product and their rows correspond:
+      * labels that carry product content match on shape (numbers abstracted, so shifting
+        model-year bands still align);
+      * otherwise rows must match on their exact tiers, numbers kept, and either both captions
+        name the same product or one table's rows are bare tiers without a product name.
+    So 'Share Savings $10,000+' never merges with 'Health Savings $10,000+', and a bare
+    '$5,000 - $24,999.99' landing-page table merges only with a table having the same tiers."""
     if a.business != b.business or not (a.context & b.context):
         return False
 
     def overlap(x: set, y: set) -> float:
         return len(x & y) / min(len(x), len(y)) if x and y else 0.0
 
-    if overlap(a.raw, b.raw) >= 0.5:
+    def jaccard(x: set, y: set) -> float:
+        return len(x & y) / len(x | y) if x and y else 0.0
+
+    if a.content and b.content and overlap(a.raw, b.raw) >= 0.5:
         return True
-    # a table whose rows are bare tiers ("$5,000 - $24,999.99") names no product itself; it can be
-    # an edition of a table that repeats the product name in every row
-    bare = a.raw == a.stripped or b.raw == b.stripped
     same_product = bool(a.product) and a.product == b.product
-    return (same_product or bare) and overlap(a.stripped, b.stripped) >= 0.5
+    if not (same_product or a.bare or b.bare):
+        return False
+    if not any(re.search(r"\d", t) for t in a.tiers | b.tiers):
+        return same_product and jaccard(a.tiers, b.tiers) >= 0.6
+    return jaccard(a.tiers, b.tiers) >= 0.6

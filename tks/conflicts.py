@@ -95,17 +95,17 @@ def _table_families(store: KnowledgeStore) -> tuple[dict, dict]:
     tables: dict[tuple, list[Block]] = defaultdict(list)
     for b in store.blocks:
         if (b.kind == "row" and b.values and b.label and b.page_class not in ("junk", "listing")
-                and _attributable(b)):
+                and _attributable(b) and any(v[0] != "amount" for v in b.values)):
             tables[(b.curl, b.caption, b.headers, b.eff_date)].append(b)
     info = {k: TableInfo(k[1], rows) for k, rows in tables.items()}
     by_sig: dict[str, list[tuple]] = defaultdict(list)
     for k, ti in info.items():
-        for sg in ti.raw | ti.stripped:
+        for sg in ti.raw | ti.stripped | ti.tiers:
             by_sig[sg].append(k)
     uf = _UnionFind()
     for a in tables:
         uf.find(a)
-        for b in {x for sg in info[a].raw | info[a].stripped for x in by_sig[sg]}:
+        for b in {x for sg in info[a].raw | info[a].stripped | info[a].tiers for x in by_sig[sg]}:
             if b == a:
                 continue
             same_page = a[0] == b[0] and a[1] == b[1]
@@ -143,7 +143,11 @@ def _table_conflicts(store: KnowledgeStore) -> list[ConflictRecord]:
             continue
         current = [b for b in rows if b.active & bit
                    and (b.curl, b.caption, b.headers, b.eff_date) not in stale]
-        pool = current or [b for b in rows if b.active & bit] or rows
+        if not current and any(b.active & bit for b in rows):
+            # every live copy of this fact sits in a table superseded by a newer edition elsewhere;
+            # the fact is reported (with the correct winner) by that newer edition's family
+            continue
+        pool = current or rows
         win = max(pool, key=_resolution_key)
         losers = [b for b in rows if _canon(b) != _canon(win)]
         ordered = sorted(by_val.values(), key=lambda bs: min(x.first_snapshot for x in bs))
