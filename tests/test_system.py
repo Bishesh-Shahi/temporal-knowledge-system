@@ -23,18 +23,18 @@ class SystemTests(unittest.TestCase):
     # ---------------------------------------------------------------- temporal
     def test_current_value_uses_latest_snapshot(self):
         a = self.ask("What is the 6-month certificate APY?")
-        self.assertIn("3.50%", a.text)
-        self.assertNotIn("2.96", a.text)
+        self.assertIn("2.65%", a.text)
+        self.assertNotIn("2.11", a.text)
         self.assertTrue(a.confident)
 
     def test_as_of_answers_from_the_snapshot_in_force(self):
         a = self.ask("What is the 6-month certificate APY?", as_of="2026-06-30")
-        self.assertIn("2.96%", a.text)
-        self.assertNotIn("3.50", a.text)
+        self.assertIn("2.11%", a.text)
+        self.assertNotIn("2.65", a.text)
 
     def test_question_embedded_date_matches_as_of(self):
         a = self.ask("What was the 6-month certificate APY as of May 2026?")
-        self.assertIn("2.96%", a.text)
+        self.assertIn("2.11%", a.text)
 
     def test_as_of_before_coverage_abstains(self):
         a = self.ask("What is the 6-month certificate APY?", as_of="2020-01-01")
@@ -43,37 +43,37 @@ class SystemTests(unittest.TestCase):
 
     def test_expired_promotion_is_not_current(self):
         a = self.ask("What is the six month share certificate APY?")
-        self.assertIn("3.50%", a.text)
-        self.assertNotIn("2.95", a.text)
+        self.assertIn("2.65%", a.text)
+        self.assertNotIn("1.75", a.text)
 
     # ---------------------------------------------------------------- stale copies & tiers
     def test_newer_effective_date_beats_stale_calculator(self):
         a = self.ask("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?")
-        self.assertIn("5.39%", a.text)
-        self.assertNotIn("5.34", a.text)
+        self.assertIn("4.93%", a.text)
+        self.assertNotIn("4.88", a.text)
         self.assertTrue(any("/rates" in s.url for s in a.sources))
-        self.assertIn("5.34%", a.conflict_note or "")    # disclosed, but not in the answer
+        self.assertIn("4.88%", a.conflict_note or "")    # disclosed, but not in the answer
 
     def test_balance_tier_selection(self):
         a = self.ask("What dividend rate do I earn on Share Savings with a balance between $10,000 and $24,999?")
-        self.assertIn("0.15%", a.text)
-        self.assertNotIn("0.20", a.text)
-        self.assertNotIn("0.35", a.text)
+        self.assertIn("0.25%", a.text)
+        self.assertNotIn("0.30", a.text)
+        self.assertNotIn("0.45", a.text)
 
     def test_superlative(self):
         a = self.ask("What is the highest Share Savings APY?")
-        self.assertIn("0.20%", a.text)
+        self.assertIn("0.30%", a.text)
         self.assertIn("25,000", a.text)
 
     def test_value_check_question(self):
-        a = self.ask("Do any savings tiers pay 0.35% APY?")
+        a = self.ask("Do any savings tiers pay 0.45% APY?")
         self.assertTrue(a.text.startswith("No"))
-        self.assertIn("0.20%", a.text)
+        self.assertIn("0.30%", a.text)
 
     def test_list_question_enumerates(self):
         a = self.ask("What are your certificate rates?")
-        self.assertIn("3.40%", a.text)
-        self.assertIn("3.50%", a.text)
+        self.assertIn("3.05%", a.text)
+        self.assertIn("2.65%", a.text)
 
     # ---------------------------------------------------------------- abstention
     def test_unknown_product_abstains_without_digits(self):
@@ -87,8 +87,8 @@ class SystemTests(unittest.TestCase):
     # ---------------------------------------------------------------- narrative evidence
     def test_newest_dated_claim_wins_and_teasers_ignored(self):
         a = self.ask("How many branches does Example CU have?")
-        self.assertIn("22", a.text)
-        self.assertNotIn("23", a.text)
+        self.assertIn("16", a.text)
+        self.assertNotIn("17", a.text)
         self.assertNotIn("99", a.text)
 
     def test_event_date_vs_reference_date(self):
@@ -104,8 +104,8 @@ class SystemTests(unittest.TestCase):
         self.assertIn("8 a.m.-6 p.m.", d.text)
 
     def test_address_prefers_branch_over_namesake(self):
-        a = self.ask("What is the address of the Galena branch?")
-        self.assertIn("11375 Oak", a.text)
+        a = self.ask("What is the address of the Springfield branch?")
+        self.assertIn("500 Oak", a.text)
 
     def test_link_question_returns_corpus_url(self):
         a = self.ask("What link should I use to see certificate rates?")
@@ -124,20 +124,20 @@ class SystemTests(unittest.TestCase):
 
     def test_conflicts_list_values_and_winner(self):
         cs = self.ks.conflicts()
-        six = [c for c in cs if "6-month" in c.topic.lower() and any("3.50%" in v for v in c.values)]
+        six = [c for c in cs if "6-month" in c.topic.lower() and any("2.65%" in v for v in c.values)]
         self.assertTrue(six, [c.topic for c in cs])
-        self.assertIn("3.50%", six[0].resolution)
-        self.assertTrue(any("2.96%" in v for v in six[0].values))
+        self.assertIn("2.65%", six[0].resolution)
+        self.assertTrue(any("2.11%" in v for v in six[0].values))
         self.assertTrue(six[0].reason)
         # different tiers are not conflicts
-        self.assertFalse([c for c in cs if "0.15%" in c.values and "0.20%" in c.values])
+        self.assertFalse([c for c in cs if "0.25%" in c.values and "0.30%" in c.values])
 
     def test_bad_inputs(self):
         for q in ("", "   ", "?" * 500):
             a = self.ask(q)
             self.assertFalse(a.confident)
         a = self.ask("What is the 6-month certificate APY?", as_of="not-a-date")
-        self.assertIn("3.50%", a.text)
+        self.assertIn("2.65%", a.text)
 
 
 class StoreTests(unittest.TestCase):
@@ -151,7 +151,7 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(st.view_index(date(2026, 1, 1)))
         contact = [b for b in st.blocks if b.curl.endswith("/contact")]
         self.assertTrue(contact and all(b.active & 0b10 for b in contact))   # carried forward
-        old = [b for b in st.blocks if b.curl.endswith("/rates") and "2.96%" in b.text]
+        old = [b for b in st.blocks if b.curl.endswith("/rates") and "2.11%" in b.text]
         self.assertTrue(old and all(not (b.active & 0b10) for b in old))     # superseded
 
     def test_ingest_order_is_enforced(self):
