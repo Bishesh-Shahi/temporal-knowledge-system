@@ -124,10 +124,10 @@ class SystemTests(unittest.TestCase):
 
     def test_conflicts_list_values_and_winner(self):
         cs = self.ks.conflicts()
-        six = [c for c in cs if "6 month" in c.topic.lower() and "3.50%" in c.values]
+        six = [c for c in cs if "6-month" in c.topic.lower() and any("3.50%" in v for v in c.values)]
         self.assertTrue(six, [c.topic for c in cs])
-        self.assertEqual(six[0].resolution, "3.50%")
-        self.assertIn("2.96%", six[0].values)
+        self.assertIn("3.50%", six[0].resolution)
+        self.assertTrue(any("2.96%" in v for v in six[0].values))
         self.assertTrue(six[0].reason)
         # different tiers are not conflicts
         self.assertFalse([c for c in cs if "0.15%" in c.values and "0.20%" in c.values])

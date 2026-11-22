@@ -135,7 +135,12 @@ class AnswerEngine:
             ref = q.ref_date
         k = self.store.view_index(ref)
         if k is None:
-            return Evidence(OUT_OF_RANGE_TEXT, [], confident=False), None
+            if as_of_d is not None:
+                # an explicit as_of before the first crawl: we cannot know how the site stood
+                return Evidence(OUT_OF_RANGE_TEXT, [], confident=False), None
+            # a date mentioned in the question ("awarded in April 2026") that precedes the first
+            # crawl: the earliest snapshot is the closest available view of that period
+            k = 0
         if q.is_still or ((q.is_yesno or q.lower.startswith("when"))
                           and re.search(r"\b(open|close|closed|closing|end|ends|expire|expires)\b", q.lower)):
             ev = self._still_open(q, k, ref)
@@ -156,7 +161,14 @@ class AnswerEngine:
             return [self._count_answer, self._text_answer]
         if q.is_rate:
             return [self._rate_answer]
+        if q.is_fee:
+            return [self._fee_answer, self._text_answer]
         return [self._text_answer]
+
+    def _fee_answer(self, q: Query, k: int) -> Optional[Evidence]:
+        """Fee questions use fee-schedule rows (dollar amounts); None lets text retrieval try."""
+        ev = self._rate_answer(q, k, fee_mode=True)
+        return ev if ev is not None and ev.confident else None
 
     # ================================================================ rates (table rows)
     def _row_context(self, b: Block) -> set[str]:
@@ -178,7 +190,7 @@ class AnswerEngine:
         sigs, caps = {}, {}
         for key, rows in tables.items():
             sigs[key] = {_label_shape(r.label) for r in rows}
-            caps[key] = set(tokens(" ".join(key[1].split(" / ")[-2:]))) - RATE_WORDS - SOFT_WORDS
+            caps[key] = table_context(key[1], rows)
         by_sig: dict[str, list[tuple]] = defaultdict(list)
         for key, ss in sigs.items():
             for sg in ss:
@@ -190,7 +202,7 @@ class AnswerEngine:
                 sa, sb = sigs[a], sigs[b]
                 if len(sa & sb) / min(len(sa), len(sb)) < 0.5:
                     continue
-                if caps[a] and caps[b] and not (caps[a] & caps[b]):
+                if not (caps[a] & caps[b]):
                     continue
                 da, db = a[3], b[3]
                 auth_a, auth_b = tables[a][0].authority, tables[b][0].authority
@@ -240,22 +252,30 @@ class AnswerEngine:
         if not q.is_list:
             extra = label_toks - qexp - hints
             score -= 0.5 * sum(idf(t) for t in extra)
+        if "business" not in q.lower and _is_business(b) and not q.is_list:
+            score -= 1.0               # personal products by default unless business is asked
         return score
 
-    def _rate_answer(self, q: Query, k: int) -> Optional[Evidence]:
+    def _rate_answer(self, q: Query, k: int, fee_mode: bool = False) -> Optional[Evidence]:
         stale = self._superseded_tables(k)
         view_date = self.store.snapshots[k].taken_on
-        wants_fee = bool(_FEE_RE.search(q.lower))
+        wants_fee = fee_mode or bool(_FEE_RE.search(q.lower))
         scored: list[tuple[float, Block]] = []
         for b in self.store.active_blocks(k):
             if b.kind != "row" or not b.values or not (b.label or b.caption):
                 continue
+            is_amount = all(v[0] == "amount" for v in b.values)
+            if fee_mode != is_amount and not (fee_mode and _FEE_RE.search(f"{b.caption} {b.label}")):
+                continue              # rate questions use rate rows; fee questions use fee rows
             if b.expires is not None and b.expires < view_date:
                 continue              # an offer that had already ended is not a current rate
             if not wants_fee and _FEE_RE.search(f"{b.caption} {b.label}"):
                 continue              # fee/payment percentages are not interest rates
             if not _attributable(b):
                 continue              # a bare tier row whose product cannot be identified
+            ctx_text = f"{b.caption} {b.label}".lower()
+            if any(re.search(rf"\b{re.escape(n)}", ctx_text) for n in q.negated):
+                continue              # explicitly excluded by the question ("not the jumbo")
             s = self._score_row(q, b, self._row_context(b))
             if s is not None:
                 scored.append((s, b))
@@ -328,7 +348,13 @@ class AnswerEngine:
             nums = [float(re.findall(r"\d+(?:\.\d+)?", v)[-1]) for kd, _h, v in b.values
                     if not q.rate_kinds or kd in q.rate_kinds] or [0.0]
             return max(nums)
-        return (max if q.superlative == "high" else min)(rows, key=lambda b: (val(b), -b.bid))
+        direction = q.superlative
+        if direction == "best":
+            # "best" means the highest yield on deposits but the lowest rate on loans
+            loan = any(v[0] in ("apr", "rate") for b in rows for v in b.values) and not any(
+                v[0] in ("apy", "dividend") for b in rows for v in b.values)
+            direction = "low" if loan else "high"
+        return (max if direction == "high" else min)(rows, key=lambda b: (val(b), -b.bid))
 
     def _percent_check(self, q: Query, rows: list[Block], notes: list[str]) -> Evidence:
         asked = {float(p.rstrip("%")) for p in q.asked_percents}
@@ -431,6 +457,8 @@ class AnswerEngine:
         org = self.store.org_label
         about_org = bool(org) and org in q.lower
         want_date = q.lower.startswith("when")
+        want_money = bool(re.search(r"\bhow much\b|\b(cost|fee|price|amount|award)", q.lower))
+        want_address = _wants_address(q)
         definitional = bool(re.match(r"(what|who) (is|are)\b|tell me about|describe|explain", q.lower))
         sent_toks = [set(tokens(s)) for s in sents]
         best_key, best_win = None, (0, 1)
@@ -448,6 +476,12 @@ class AnswerEngine:
                     bonus += 1.0
                 if want_date and LONG_DATE_RE.search(window):
                     bonus += 2.0
+                if want_money and "$" in window:
+                    bonus += 2.0
+                if want_address and _ADDRESS_RE.search(window):
+                    bonus += 3.0
+                if q.entities and all(e in toks for e in q.entities):
+                    bonus += 1.5
                 width_pref = (w if definitional else -w)
                 key = (round(mass + bonus, 6), width_pref, -i)
                 if best_key is None or key > best_key:
@@ -464,7 +498,17 @@ class AnswerEngine:
         if not ranked:
             return Evidence(REFUSAL_TEXT, [], confident=False)
         best = self._pick_recent(ranked)
+        if _wants_address(q):
+            # an address question is answered by a passage that contains an address
+            addr = [r for r in ranked[:25] if _ADDRESS_RE.search(r[2].text) and r[1] >= MIN_TEXT_COVERAGE
+                    and self._entities_ok(q, r[2])]
+            if addr:
+                best = max(addr, key=lambda r: (r[1], r[0]))
         if best[1] < MIN_TEXT_COVERAGE or not self._entities_ok(q, best[2]):
+            return Evidence(REFUSAL_TEXT, [], confident=False)
+        head = _head_noun(q)
+        if head and not any(e in best[2].terms for e in expand(head)):
+            # the thing asked about ("daily withdrawal *limit*") is not in the evidence
             return Evidence(REFUSAL_TEXT, [], confident=False)
         same_page = [best[2]] + [r[2] for r in ranked[:15]
                                  if r[2].curl == best[2].curl and r[2] is not best[2]
@@ -752,3 +796,41 @@ def _attributable(b: Block) -> bool:
     words = [t for t in tokens(f"{b.caption} {b.label} {b.heading.split(' > ')[-1] if b.heading else ''}")
              if t.isalpha() and t not in SOFT_WORDS and t not in RATE_WORDS]
     return bool(words)
+
+
+_ADDRESS_RE = re.compile(
+    r"\b\d{2,6}\s+(?:[NSEW]\.?\s+)?[A-Z][A-Za-z.]*(?:\s+[A-Z][A-Za-z.]*){0,3}\s+"
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Dr|Drive|Ln|Lane|Blvd|Boulevard|Way|Ct|Court|Pkwy|Hwy|Pl)\b\.?"
+    r"|\bP\.?\s?O\.?\s+Box\s+\d+", re.I)
+_ANSWER_TYPE_NOUNS = frozenset(tokens(
+    "address addresses number numbers phone hours hour rate rates apy apr fee fees cost amount date "
+    "dates time name names url link email website location locations price"))
+
+
+def _wants_address(q: Query) -> bool:
+    return bool(re.search(r"\b(address|located|location of|where is|mail|mailing)\b", q.lower))
+
+
+def _head_noun(q: Query) -> Optional[str]:
+    """Head noun of a 'what is the X (on|for|of ...)' question, unless X names the answer type
+    (an address is not literally written as 'address')."""
+    m = re.match(r"(?:what|which)(?:'s| is| are| was)\s+(?:the|a|an|your|my)?\s*([a-z' -]+?)"
+                 r"(?:\s+(?:on|for|of|at|to|in|with|from|when|if)\b|\?|$)", q.lower)
+    if not m:
+        return None
+    toks = [t for t in tokens(m.group(1)) if t.isalpha()]
+    if not toks:
+        return None
+    head = toks[-1]
+    if head in _ANSWER_TYPE_NOUNS or head in SOFT_WORDS or head in RATE_WORDS:
+        return None
+    return head
+
+
+def table_context(caption: str, rows: list[Block]) -> set[str]:
+    """Product words of a table: caption, section heading and row labels (shared by stale-table
+    detection and conflict clustering so both use one definition of 'the same table')."""
+    heading = rows[0].heading.split(" > ")[-1] if rows and rows[0].heading else ""
+    labels = " ".join(r.label for r in rows)
+    src = f"{' '.join(caption.split(' / ')[-2:])} {heading} {labels}"
+    return {t for t in tokens(src) if t.isalpha()} - RATE_WORDS - SOFT_WORDS

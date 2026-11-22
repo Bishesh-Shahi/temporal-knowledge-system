@@ -163,6 +163,7 @@ def parse_page(markdown: str, drop_lines: frozenset[str] = frozenset(),
     chunk: list[str] = []
     chunk_links: list[tuple[str, str]] = []
     captions: list[str] = []      # short plain lines since the last table/heading
+    group = ""                    # table-group label ("Certificates") carried to following tables
 
     def heading_path() -> str:
         return " > ".join(t for _, t in headings)
@@ -202,6 +203,7 @@ def parse_page(markdown: str, drop_lines: frozenset[str] = frozenset(),
             if htext:
                 headings.append((level, htext))
                 captions = [htext]
+                group = ""
             i += 1
             continue
         if s.startswith("|") and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1].strip()):
@@ -214,7 +216,16 @@ def parse_page(markdown: str, drop_lines: frozenset[str] = frozenset(),
                 rows.append([clean_inline(c) for c in _split_cells(lines[j])])
                 j += 1
             eff = _effective_near(lines, j, n, 1) or _effective_near(lines, i - 1, -1, -1)
-            caption = " / ".join(captions[-2:])
+            # caption = group label + table label.  A table preceded by a single short line
+            # ("Regular") inherits the group of the previous table ("Certificates").
+            if len(captions) >= 2:
+                group = captions[-2]
+                caption = f"{group} / {captions[-1]}"
+            elif captions:
+                caption = (f"{group} / {captions[-1]}" if group and group != captions[-1]
+                           else captions[-1])
+            else:
+                caption = group
             for cells in rows:
                 blocks.append(_row_block(heading_path(), caption, header, cells, eff))
             captions = []
@@ -232,7 +243,8 @@ def parse_page(markdown: str, drop_lines: frozenset[str] = frozenset(),
         if text:
             para.append(text)
             para_links.extend(links)
-            inline = _inline_fact(text, heading_path(), headings[-1][1] if headings else "")                 if inline_facts else None
+            inline = (_inline_fact(text, heading_path(), headings[-1][1] if headings else "")
+                      if inline_facts else None)
             if inline is not None:
                 blocks.append(inline)
         i += 1
@@ -298,6 +310,14 @@ def _row_block(heading: str, caption: str, header: list[str], cells: list[str],
                 values.append((_value_kind(h, c), h, pct.replace(" ", "")))
         elif not any(k in h.lower() for k in _NON_LABEL_HEADERS) and c not in ("-", "—"):
             label_parts.append(c)
+    if not values:
+        # fee schedules and similar tables state dollar amounts instead of rates
+        for h, c in zip(header, cells):
+            if c and "$" in c and not any(k in h.lower() for k in ("min", "payment", "example", "balance")):
+                for amt in re.findall(r"\$\s?\d[\d,]*(?:\.\d+)?", c):
+                    values.append(("amount", h, amt.replace(" ", "")))
+        if values and label_parts and any(v[2] in label_parts[0] for v in values):
+            values = []
     label = " | ".join(label_parts)
     shown = "; ".join(f"{h}: {c}" if h else c for h, c in zip(header, cells) if c)
     text = f"{caption}: {shown}" if caption else shown

@@ -62,7 +62,7 @@ STOPWORDS = frozenset(
     them then there these they this those to too us was we were what whats when where which while who
     whom why will with would you your yours tell give get know like want need provide show let current
     currently right now today dupaco dupacos s about any all also just much many there's i'm i'd
-    im id ive going""".split()
+    im id ive going not over under non without via per""".split()
 )
 
 _NUMBER_WORDS = {
@@ -76,7 +76,8 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
 _SUFFIXES = ("ibility", "ability", "ations", "ation", "itions", "ition", "izing", "ized", "izes", "ize", "ings", "ing",
              "ions", "ion", "edly", "ed", "ies", "es", "s", "e")
 _STEM_EXCEPTIONS = {"news": "news", "business": "business", "yes": "yes", "visa": "visa",
-                    "hours": "hour", "plus": "plus", "bonus": "bonus", "status": "status"}
+                    "hours": "hour", "plus": "plus", "bonus": "bonus", "status": "status",
+                    "foundation": "foundation", "foundations": "foundation"}
 
 
 def stem(tok: str) -> str:
